@@ -1210,20 +1210,52 @@ execute_async() {
   # Close inherited stdout/stderr (>/dev/null 2>&1) so that pipe consumers
   # (e.g., $() command substitution) don't block waiting for this subshell.
   # All output goes to files via ordered_exec, not stdout/stderr.
+  #
+  # IMPORTANT: We use ordered_spawn (non-blocking) so we can capture the REAL
+  # command pid (ORD_CMD_PID), then wait on it in a separate background
+  # subshell. Previously this used `ordered_exec` inside `{...} &`, which made
+  # `$!` the wrapper-subshell pid — not the actual command — so polling could
+  # not detect when the real command died (status stuck at "running").
+  ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file" "false"
+  local cmd_pid=$ORD_CMD_PID
+  local merger_pid=$ORD_MERGER_PID
+  local fifos=("${ORD_FIFOS[@]}")
+
+  # Reaper: waits for the real command, updates status FIRST, then best-effort
+  # cleans up the merger and FIFOs. We must NOT block status updates on merger
+  # cleanup — if seq_split_reader / sed hang on a FIFO whose writer end was
+  # never properly closed (e.g. command subshell killed by SIGPIPE before
+  # opening the fd, output truncated by `| tail -N`, etc.), the merger may
+  # never exit. Job status would otherwise be stuck at "running" forever.
   {
     local exit_code=0
-    ordered_exec "$command" "$stdout_file" "$stderr_file" "$seq_file" "false" || exit_code=$?
+    wait "$cmd_pid" 2> /dev/null || exit_code=$?
 
-    # Update job state atomically on completion
+    # Flip status as soon as the real command exits.
     if [[ $exit_code -eq 0 ]]; then
       update_job_status "$job_id" "completed" "0"
     else
       update_job_status "$job_id" "failed" "$exit_code"
     fi
-  } > /dev/null 2>&1 &
-  local cmd_pid=$!
 
-  # Update with actual process ID (atomic)
+    # Best-effort merger reap with a hard timeout so we never leak wrappers.
+    # If the merger doesn't drain within the grace window, kill it outright.
+    {
+      sleep "${ACTUATOR_MERGER_GRACE:-5}"
+      kill -TERM "$merger_pid" 2> /dev/null || true
+      sleep 1
+      kill -KILL "$merger_pid" 2> /dev/null || true
+    } &
+    local _merger_killer=$!
+    wait "$merger_pid" 2> /dev/null || true
+    kill "$_merger_killer" 2> /dev/null || true
+    wait "$_merger_killer" 2> /dev/null || true
+    rm -f "${fifos[@]}" 2> /dev/null || true
+  } > /dev/null 2>&1 &
+  disown 2> /dev/null || true
+
+  # Record the REAL command pid (not the wrapper) so poll_job's kill -0 check
+  # actually reflects whether the workload is alive.
   update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
 
   # Start timeout monitor if configured
